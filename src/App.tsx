@@ -11,7 +11,7 @@ import {
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
 
 const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000/api/upload";
+import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000/upload";
 const CHUNK_SIZE = 5 * 1024 * 1024;
 
 type UploadPhase = "idle" | "initializing" | "uploading" | "completing" | "completed" | "error";
