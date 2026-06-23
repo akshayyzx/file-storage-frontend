@@ -10,8 +10,23 @@ import {
 } from "lucide-react";
 import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
 
-const API_BASE_URL =
-import.meta.env.VITE_API_BASE_URL ?? "http://localhost:5000/upload";
+const DEFAULT_API_BASE_URL = "http://localhost:5000/api/upload";
+
+function normalizeApiBaseUrl(rawBaseUrl?: string) {
+  const baseUrl = (rawBaseUrl?.trim() || DEFAULT_API_BASE_URL).replace(/\/+$/, "");
+
+  if (/\/api\/upload$/i.test(baseUrl) || /\/upload$/i.test(baseUrl)) {
+    return baseUrl;
+  }
+
+  if (/\/api$/i.test(baseUrl)) {
+    return `${baseUrl}/upload`;
+  }
+
+  return `${baseUrl}/api/upload`;
+}
+
+const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 const CHUNK_SIZE = 5 * 1024 * 1024;
 
 type UploadPhase = "idle" | "initializing" | "uploading" | "completing" | "completed" | "error";
@@ -103,7 +118,10 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
 
-  const payload = await response.json();
+  const payload = await readJsonResponse<T & { message?: string; success?: boolean }>(
+    response,
+    `Request to ${response.url} failed`
+  );
 
   if (!response.ok || payload.success === false) {
     throw new Error(payload.message ?? "Request failed");
@@ -114,13 +132,38 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 
 async function getStatus(uploadId: string) {
   const response = await fetch(`${API_BASE_URL}/status/${uploadId}`);
-  const payload = (await response.json()) as StatusResponse;
+  const payload = await readJsonResponse<StatusResponse>(
+    response,
+    `Unable to fetch upload status from ${response.url}`
+  );
 
   if (!response.ok || payload.success === false) {
     throw new Error(payload.message ?? "Unable to fetch upload status");
   }
 
   return payload.data;
+}
+
+async function readJsonResponse<T extends { message?: string; success?: boolean }>(
+  response: Response,
+  fallbackMessage: string
+) {
+  const contentType = response.headers.get("content-type") ?? "";
+  const rawPayload = await response.text();
+
+  if (!contentType.includes("application/json")) {
+    throw new Error(
+      `${fallbackMessage}: expected JSON but received ${
+        contentType || "an unknown content type"
+      }. Check VITE_API_BASE_URL.`
+    );
+  }
+
+  try {
+    return JSON.parse(rawPayload) as T;
+  } catch {
+    throw new Error(`${fallbackMessage}: server returned invalid JSON.`);
+  }
 }
 
 export default function App() {
