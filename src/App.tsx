@@ -29,7 +29,15 @@ function normalizeApiBaseUrl(rawBaseUrl?: string) {
 const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 const CHUNK_SIZE = 5 * 1024 * 1024;
 
-type UploadPhase = "idle" | "initializing" | "uploading" | "completing" | "completed" | "error";
+type UploadPhase =
+  | "idle"
+  | "initializing"
+  | "uploading"
+  | "pausing"
+  | "paused"
+  | "completing"
+  | "completed"
+  | "error";
 
 type UploadedPart = {
   partNumber: number;
@@ -67,6 +75,10 @@ function formatBytes(value: number) {
   const amount = value / 1024 ** index;
 
   return `${amount.toFixed(amount >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function getConfirmedBytes(completedChunks: number, fileSize: number) {
+  return Math.min(completedChunks * CHUNK_SIZE, fileSize);
 }
 
 function uploadChunk({
@@ -168,6 +180,7 @@ async function readJsonResponse<T extends { message?: string; success?: boolean 
 
 export default function App() {
   const inputRef = useRef<HTMLInputElement>(null);
+  const pauseRequestedRef = useRef(false);
   const [file, setFile] = useState<File | null>(null);
   const [phase, setPhase] = useState<UploadPhase>("idle");
   const [uploadId, setUploadId] = useState("");
@@ -197,6 +210,7 @@ export default function App() {
   );
 
   function resetUpload() {
+    pauseRequestedRef.current = false;
     setFile(null);
     setPhase("idle");
     setUploadId("");
@@ -216,6 +230,7 @@ export default function App() {
       return;
     }
 
+    pauseRequestedRef.current = false;
     setFile(nextFile);
     setPhase("idle");
     setUploadId("");
@@ -244,54 +259,98 @@ export default function App() {
     return nextStatus;
   }
 
+  async function streamChunks(nextUploadId: string, startIndex: number, nextFile: File) {
+    let confirmedBytes = getConfirmedBytes(startIndex, nextFile.size);
+
+    for (let index = startIndex; index < totalChunks; index += 1) {
+      if (pauseRequestedRef.current) {
+        setPhase("paused");
+        setMessage("Upload paused");
+        return false;
+      }
+
+      const partNumber = index + 1;
+      const start = index * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, nextFile.size);
+      const chunk = nextFile.slice(start, end);
+
+      setMessage(`Uploading chunk ${partNumber} of ${totalChunks}`);
+      setActiveChunkBytes(0);
+
+      await uploadChunk({
+        uploadId: nextUploadId,
+        partNumber,
+        chunk,
+        onProgress: setActiveChunkBytes,
+      });
+
+      confirmedBytes += chunk.size;
+      setUploadedBytes(confirmedBytes);
+      setActiveChunkBytes(0);
+      await refreshStatus(nextUploadId);
+    }
+
+    return true;
+  }
+
+  function pauseUpload() {
+    if (phase !== "uploading") {
+      return;
+    }
+
+    pauseRequestedRef.current = true;
+    setPhase("pausing");
+    setMessage("Pausing after current chunk");
+  }
+
   async function startUpload() {
-    if (!file || phase === "uploading" || phase === "initializing") {
+    if (!file || phase === "uploading" || phase === "initializing" || phase === "completing") {
       return;
     }
 
     try {
       setError("");
-      setPhase("initializing");
-      setMessage("Creating multipart upload");
+      pauseRequestedRef.current = false;
 
-      const initialized = await postJson<InitializeResponse>("/initialize", {
-        fileName: file.name,
-        fileSize: file.size,
-        totalChunks,
-      });
+      let nextUploadId = uploadId;
+      let nextUploadedChunks = uploadedChunks;
 
-      setUploadId(initialized.uploadId);
-      setMessage("Uploading chunks");
-      setPhase("uploading");
+      if (phase === "paused" && uploadId) {
+        setMessage("Resuming upload");
+        setPhase("uploading");
+        const nextStatus = await refreshStatus(uploadId);
+        nextUploadedChunks = nextStatus.uploadedParts.length;
+        setUploadedBytes(getConfirmedBytes(nextUploadedChunks, file.size));
+      } else {
+        setPhase("initializing");
+        setMessage("Creating multipart upload");
 
-      let confirmedBytes = 0;
-
-      for (let index = 0; index < totalChunks; index += 1) {
-        const partNumber = index + 1;
-        const start = index * CHUNK_SIZE;
-        const end = Math.min(start + CHUNK_SIZE, file.size);
-        const chunk = file.slice(start, end);
-
-        setMessage(`Uploading chunk ${partNumber} of ${totalChunks}`);
-        setActiveChunkBytes(0);
-
-        await uploadChunk({
-          uploadId: initialized.uploadId,
-          partNumber,
-          chunk,
-          onProgress: setActiveChunkBytes,
+        const initialized = await postJson<InitializeResponse>("/initialize", {
+          fileName: file.name,
+          fileSize: file.size,
+          totalChunks,
         });
 
-        confirmedBytes += chunk.size;
-        setUploadedBytes(confirmedBytes);
-        setActiveChunkBytes(0);
-        await refreshStatus(initialized.uploadId);
+        nextUploadId = initialized.uploadId;
+        nextUploadedChunks = 0;
+        setUploadId(initialized.uploadId);
+        setUploadedBytes(0);
+        setUploadedChunks(0);
+        setStatus(null);
+        setMessage("Uploading chunks");
+        setPhase("uploading");
+      }
+
+      const finishedUploading = await streamChunks(nextUploadId, nextUploadedChunks, file);
+
+      if (!finishedUploading) {
+        return;
       }
 
       setPhase("completing");
       setMessage("Finalizing upload");
-      await postJson("/complete", { uploadId: initialized.uploadId });
-      await refreshStatus(initialized.uploadId);
+      await postJson("/complete", { uploadId: nextUploadId });
+      await refreshStatus(nextUploadId);
       setUploadedBytes(file.size);
       setUploadedChunks(totalChunks);
       setPhase("completed");
@@ -303,8 +362,13 @@ export default function App() {
     }
   }
 
-  const isBusy = phase === "initializing" || phase === "uploading" || phase === "completing";
+  const isBusy =
+    phase === "initializing" ||
+    phase === "uploading" ||
+    phase === "pausing" ||
+    phase === "completing";
   const canUpload = Boolean(file) && !isBusy && phase !== "completed";
+  const canPause = phase === "uploading";
 
   return (
     <main className="app-shell">
@@ -347,7 +411,18 @@ export default function App() {
           <div className="action-row">
             <button className="primary-button" type="button" onClick={startUpload} disabled={!canUpload}>
               {isBusy ? <Loader2 className="spin" size={20} /> : <Cloud size={20} />}
-              {phase === "completed" ? "Completed" : isBusy ? "Uploading" : "Start upload"}
+              {phase === "completed"
+                ? "Completed"
+                : phase === "paused"
+                  ? "Resume upload"
+                  : isBusy
+                    ? phase === "pausing"
+                      ? "Pausing"
+                      : "Uploading"
+                    : "Start upload"}
+            </button>
+            <button className="icon-button" type="button" onClick={pauseUpload} disabled={!canPause} title="Pause upload">
+              <PauseCircle size={20} />
             </button>
             <div className={`status-pill status-${phase}`}>
               {phase === "completed" ? <CheckCircle2 size={17} /> : <PauseCircle size={17} />}
